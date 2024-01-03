@@ -6,6 +6,8 @@ class AsyncTask:
         self.args = args
         self.yields = []
         self.results = []
+        self.last_stop = False
+        self.processing = False
 
 
 async_tasks = []
@@ -13,7 +15,6 @@ async_tasks = []
 
 def worker():
     global async_tasks
-
     import traceback
     import math
     import numpy as np
@@ -36,11 +37,13 @@ def worker():
     import extras.face_crop
     import fooocus_version
 
+    from modules.censor import censor_batch
+
     from modules.sdxl_styles import apply_style, apply_wildcards, fooocus_expansion
     from modules.private_logger import log
     from extras.expansion import safe_str
     from modules.util import remove_empty_str, HWC3, resize_image, \
-        get_image_shape_ceil, set_image_shape_ceil, get_shape_ceil, resample_image
+        get_image_shape_ceil, set_image_shape_ceil, get_shape_ceil, resample_image, erode_or_dilate
     from modules.upscaler import perform_upscale
 
     try:
@@ -56,9 +59,13 @@ def worker():
         print(f'[Fooocus] {text}')
         async_task.yields.append(['preview', (number, text, None)])
 
-    def yield_result(async_task, imgs, do_not_show_finished_images=False):
+    def yield_result(async_task, imgs, do_not_show_finished_images=False, progressbar_index=13):
         if not isinstance(imgs, list):
             imgs = [imgs]
+
+        if modules.config.default_black_out_nsfw or advanced_parameters.black_out_nsfw:
+            progressbar(async_task, progressbar_index, 'Checking for NSFW content ...')
+            imgs = censor_batch(imgs)
 
         async_task.results = async_task.results + imgs
 
@@ -115,12 +122,14 @@ def worker():
     @torch.inference_mode()
     def handler(async_task):
         execution_start_time = time.perf_counter()
+        async_task.processing = True
 
         args = async_task.args
         args.reverse()
 
         prompt = args.pop()
         negative_prompt = args.pop()
+        translate_prompts = args.pop()
         style_selections = args.pop()
         performance_selection = args.pop()
         aspect_ratios_selection = args.pop()
@@ -139,6 +148,7 @@ def worker():
         outpaint_selections = args.pop()
         inpaint_input_image = args.pop()
         inpaint_additional_prompt = args.pop()
+        inpaint_mask_image_upload = args.pop()
 
         cn_tasks = {x: [] for x in flags.ip_list}
         for _ in range(4):
@@ -195,6 +205,11 @@ def worker():
             modules.patch.negative_adm_scale = advanced_parameters.adm_scaler_negative = 1.0
             modules.patch.adm_scaler_end = advanced_parameters.adm_scaler_end = 0.0
             steps = 8
+
+        if translate_prompts:
+            from modules.translator import translate2en
+            prompt = translate2en(prompt, 'prompt')
+            negative_prompt = translate2en(negative_prompt, 'negative prompt')
 
         modules.patch.adaptive_cfg = advanced_parameters.adaptive_cfg
         print(f'[Parameters] Adaptive CFG = {modules.patch.adaptive_cfg}')
@@ -274,6 +289,22 @@ def worker():
                     and isinstance(inpaint_input_image, dict):
                 inpaint_image = inpaint_input_image['image']
                 inpaint_mask = inpaint_input_image['mask'][:, :, 0]
+                
+                if advanced_parameters.inpaint_mask_upload_checkbox:
+                    if isinstance(inpaint_mask_image_upload, np.ndarray):
+                        if inpaint_mask_image_upload.ndim == 3:
+                            H, W, C = inpaint_image.shape
+                            inpaint_mask_image_upload = resample_image(inpaint_mask_image_upload, width=W, height=H)
+                            inpaint_mask_image_upload = np.mean(inpaint_mask_image_upload, axis=2)
+                            inpaint_mask_image_upload = (inpaint_mask_image_upload > 127).astype(np.uint8) * 255
+                            inpaint_mask = np.maximum(inpaint_mask, inpaint_mask_image_upload)
+
+                if int(advanced_parameters.inpaint_erode_or_dilate) != 0:
+                    inpaint_mask = erode_or_dilate(inpaint_mask, advanced_parameters.inpaint_erode_or_dilate)
+
+                if advanced_parameters.invert_mask_checkbox:
+                    inpaint_mask = 255 - inpaint_mask
+
                 inpaint_image = HWC3(inpaint_image)
                 if isinstance(inpaint_image, np.ndarray) and isinstance(inpaint_mask, np.ndarray) \
                         and (np.any(inpaint_mask > 127) or len(outpaint_selections) > 0):
@@ -715,13 +746,15 @@ def worker():
             done_steps = current_task_id * steps + step
             async_task.yields.append(['preview', (
                 int(15.0 + 85.0 * float(done_steps) / float(all_steps)),
-                f'Step {step}/{total_steps} in the {current_task_id + 1}-th Sampling',
+                f'Sampling Image {current_task_id + 1}/{image_number}, Step {step + 1}/{total_steps} ...',
                 y)])
 
         for current_task_id, task in enumerate(tasks):
             execution_start_time = time.perf_counter()
 
             try:
+                if async_task.last_stop is not False:
+                    fcbh.model_management.interrupt_current_processing()
                 positive_cond, negative_cond = task['c'], task['uc']
 
                 if 'cn' in goals:
@@ -776,6 +809,7 @@ def worker():
                         ('Refiner Switch', refiner_switch),
                         ('Sampler', sampler_name),
                         ('Scheduler', scheduler_name),
+                        ('Sampling Steps Override', advanced_parameters.overwrite_step),
                         ('Seed', task['task_seed']),
                     ]
                     for li, (n, w) in enumerate(loras):
@@ -784,10 +818,11 @@ def worker():
                     d.append(('Version', 'v' + fooocus_version.version))
                     log(x, d)
 
-                yield_result(async_task, imgs, do_not_show_finished_images=len(tasks) == 1)
+                yield_result(async_task, imgs, do_not_show_finished_images=len(tasks) == 1, progressbar_index=int(15.0 + 85.0 * float((current_task_id + 1) * steps) / float(all_steps)))
             except ldm_patched.modules.model_management.InterruptProcessingException as e:
-                if shared.last_stop == 'skip':
+                if async_task.last_stop == 'skip':
                     print('User skipped')
+                    async_task.last_stop = False
                     continue
                 else:
                     print('User stopped')
@@ -795,7 +830,7 @@ def worker():
 
             execution_time = time.perf_counter() - execution_start_time
             print(f'Generating and saving time: {execution_time:.2f} seconds')
-
+        async_task.processing = False
         return
 
     while True:

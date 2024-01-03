@@ -119,6 +119,14 @@ def load_parameter_button_click(raw_prompt_txt, is_generating):
         results.append(gr.update())
 
     try:
+        h = loaded_parameter_dict.get('Sampling Steps Override', None)
+        assert h is not None
+        h = float(h)
+        results.append(h)
+    except:
+        results.append(gr.update())
+
+    try:
         h = loaded_parameter_dict.get('Seed', None)
         assert h is not None
         h = int(h)
