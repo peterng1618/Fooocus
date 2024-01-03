@@ -33,7 +33,12 @@ default_parameters = {
 }  # stop, weight
 
 inpaint_engine_versions = ['None', 'v1', 'v2.5', 'v2.6']
-performance_selections = ['Speed', 'Quality', 'Extreme Speed']
+
+performance_selections = [
+    ('Quality <span style="color: grey;"> \U00002223 60 steps</span>', 'Quality'),
+    ('Speed <span style="color: grey;"> \U00002223 30 steps</span>', 'Speed'),
+    ('Extreme Speed (LCM) <span style="color: grey;"> \U00002223 8 steps, intermediate results disabled</span>', 'Extreme Speed')
+]
 
 inpaint_option_default = 'Inpaint or Outpaint (default)'
 inpaint_option_detail = 'Improve Detail (face, hand, eyes, etc.)'
