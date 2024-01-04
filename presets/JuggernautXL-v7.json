@@ -37,6 +37,7 @@
         "Fooocus Sharp"
     ],
     "default_aspect_ratio": "1152*896",
+    "default_overwrite_step": -1,
     "checkpoint_downloads": {
         "juggernautXL_v7Rundiffusion.safetensors": "https://civitai.com/api/download/models/240840?type=Model&format=SafeTensor&size=full&fp=fp16"
     },
