@@ -23,19 +23,47 @@ from modules.private_logger import get_current_html_path
 from modules.ui_gradio_extensions import reload_javascript
 from modules.auth import auth_enabled, check_auth
 
-def get_task(*args):
-    args = list(args)
-    currentTask = args.pop(0)
-    currentTask = worker.AsyncTask(args=args)
-    return currentTask
 
-def generate_clicked(task):
+QUEUE = []
+
+
+def queue_add(*args):
+    QUEUE.append(args)
+
+
+def queue_start(*args):
+    if not QUEUE:
+        yield from generate_clicked(*args)
+        return
+    for arg in QUEUE:
+        yield from generate_clicked(*arg)
+    QUEUE.clear()
+
+
+def generate_all_styles(*args):
+    if not QUEUE:
+        for style in legal_style_names:
+            args_style = list(args)
+            args_style[3] = [style]
+            yield from generate_clicked(*args_style)
+        return
+    for arg in QUEUE:
+        for style in legal_style_names:
+            argss = list(arg)
+            argss[3] = [style]
+            yield from generate_clicked(*argss)
+    QUEUE.clear()
+
+
+
+def generate_clicked(*args):
     import ldm_patched.modules.model_management as model_management
 
     with model_management.interrupt_processing_mutex:
         model_management.interrupt_processing = False
     # outputs=[progress_html, progress_window, progress_gallery, gallery]
     execution_start_time = time.perf_counter()
+    task = worker.AsyncTask(args=list(args))
     finished = False
 
     yield gr.update(visible=True, value=modules.html.make_progress_html(1, 'Waiting for task to start ...')), \
@@ -91,7 +119,6 @@ shared.gradio_root = gr.Blocks(
     css=modules.html.css).queue()
 
 with shared.gradio_root:
-    currentTask = gr.State(worker.AsyncTask(args=[]))
     with gr.Row():
         with gr.Column(scale=2):
             with gr.Row():
@@ -116,25 +143,26 @@ with shared.gradio_root:
                 with gr.Column(scale=3, min_width=0):
                     generate_button = gr.Button(label="Generate", value="Generate", elem_classes='type_row', elem_id='generate_button', visible=True)
                     load_parameter_button = gr.Button(label="Load Parameters", value="Load Parameters", elem_classes='type_row', elem_id='load_parameter_button', visible=False)
+                    add_to_queue_button = gr.Button(label="Add to queue", value="Add to queue (0)", elem_classes='type_row', elem_id='add_to_queue_button', visible=True)
+                    generate_all_styles_button = gr.Button(label="Generate All Styles", value="Generate All Styles", elem_classes='type_row', elem_id='generate_all_styles_button', visible=True)
                     skip_button = gr.Button(label="Skip", value="Skip", elem_classes='type_row_half', visible=False)
                     stop_button = gr.Button(label="Stop", value="Stop", elem_classes='type_row_half', elem_id='stop_button', visible=False)
 
-                    def stop_clicked(currentTask):
+                    def stop_clicked():
                         import ldm_patched.modules.model_management as model_management
-                        currentTask.last_stop = 'stop'
-                        if (currentTask.processing):
-                            model_management.interrupt_current_processing()
-                        return currentTask
+                        shared.last_stop = 'stop'
+                        model_management.interrupt_current_processing()
+                        return [gr.update(interactive=False)] * 2
 
-                    def skip_clicked(currentTask):
+                    def skip_clicked():
                         import ldm_patched.modules.model_management as model_management
-                        currentTask.last_stop = 'skip'
-                        if (currentTask.processing):
-                            model_management.interrupt_current_processing()
-                        return currentTask
+                        shared.last_stop = 'skip'
+                        model_management.interrupt_current_processing()
+                        return
 
-                    stop_button.click(stop_clicked, inputs=currentTask, outputs=currentTask, queue=False, show_progress=False, _js='cancelGenerateForever')
-                    skip_button.click(skip_clicked, inputs=currentTask, outputs=currentTask, queue=False, show_progress=False)
+                    stop_button.click(stop_clicked, outputs=[skip_button, stop_button],
+                                      queue=False, show_progress=False, _js='cancelGenerateForever')
+                    skip_button.click(skip_clicked, queue=False, show_progress=False)
             with gr.Row(elem_classes='advanced_check_row'):
                 input_image_checkbox = gr.Checkbox(label='Input Image', value=False, container=False, elem_classes='min_check')
                 advanced_checkbox = gr.Checkbox(label='Advanced', value=modules.config.default_advanced_checkbox, container=False, elem_classes='min_check')
@@ -615,7 +643,7 @@ with shared.gradio_root:
         ], show_progress=False, queue=False)
 
         ctrls = [
-            currentTask, prompt, negative_prompt, translate_prompts, style_selections,
+            prompt, negative_prompt, translate_prompts, style_selections,
             performance_selection, aspect_ratios_selection, image_number, image_seed, sharpness, guidance_scale
         ]
 
@@ -624,6 +652,8 @@ with shared.gradio_root:
         ctrls += [uov_method, uov_input_image]
         ctrls += [outpaint_selections, inpaint_input_image, inpaint_additional_prompt, inpaint_mask_image]
         ctrls += ip_ctrls
+
+        state_is_generating = gr.State(False)
 
         def parse_meta(raw_prompt_txt, is_generating):
             loaded_json = None
@@ -648,15 +678,28 @@ with shared.gradio_root:
 
         load_parameter_button.click(modules.meta_parser.load_parameter_button_click, inputs=[prompt, state_is_generating], outputs=load_parameter_outputs, queue=False, show_progress=False)
 
-        generate_button.click(lambda: (gr.update(visible=True, interactive=True), gr.update(visible=True, interactive=True), gr.update(visible=False, interactive=False), [], True),
-                              outputs=[stop_button, skip_button, generate_button, gallery, state_is_generating]) \
+        generate_button.click(lambda: (gr.update(visible=True, interactive=True), gr.update(visible=True, interactive=True), gr.update(visible=False, interactive=False), gr.update(visible=False, interactive=False), gr.update(visible=False, interactive=False), [], True),
+                              outputs=[stop_button, skip_button, generate_button, add_to_queue_button, generate_all_styles_button, gallery, state_is_generating]) \
             .then(fn=refresh_seed, inputs=[seed_random, image_seed], outputs=image_seed) \
             .then(advanced_parameters.set_all_advanced_parameters, inputs=adps) \
-            .then(fn=get_task, inputs=ctrls, outputs=currentTask) \
-            .then(fn=generate_clicked, inputs=currentTask, outputs=[progress_html, progress_window, progress_gallery, gallery]) \
-            .then(lambda: (gr.update(visible=True, interactive=True), gr.update(visible=False, interactive=False), gr.update(visible=False, interactive=False), False),
-                  outputs=[generate_button, stop_button, skip_button, state_is_generating]) \
-            .then(fn=lambda: None, _js='playNotification').then(fn=lambda: None, _js='refresh_grid_delayed')
+            .then(fn=queue_start, inputs=ctrls, outputs=[progress_html, progress_window, progress_gallery, gallery]) \
+            .then(lambda: (gr.update(visible=True, interactive=True), gr.update(visible=True, interactive=True), gr.update(visible=True, interactive=True), gr.update(visible=False, interactive=False), gr.update(visible=False, interactive=False), False),
+                  outputs=[generate_button, add_to_queue_button, generate_all_styles_button, stop_button, skip_button, state_is_generating]) \
+            .then(fn=lambda: None, _js='playNotification').then(fn=lambda: None, _js='refresh_grid_delayed') \
+            .then(lambda: (gr.update(value=f"Add to queue ({len(QUEUE)})")), outputs=[add_to_queue_button])
+        
+        generate_all_styles_button.click(lambda: (gr.update(visible=True, interactive=True), gr.update(visible=True, interactive=True), gr.update(visible=False, interactive=False), gr.update(visible=False, interactive=False), gr.update(visible=False, interactive=False), [], True),
+                              outputs=[stop_button, skip_button, generate_button, add_to_queue_button, generate_all_styles_button, gallery, state_is_generating]) \
+            .then(fn=refresh_seed, inputs=[seed_random, image_seed], outputs=image_seed) \
+            .then(advanced_parameters.set_all_advanced_parameters, inputs=adps) \
+            .then(fn=generate_all_styles, inputs=ctrls, outputs=[progress_html, progress_window, progress_gallery, gallery]) \
+            .then(lambda: (gr.update(visible=True, interactive=True), gr.update(visible=True, interactive=True), gr.update(visible=True, interactive=True), gr.update(visible=False, interactive=False), gr.update(visible=False, interactive=False), False),
+                  outputs=[generate_button, add_to_queue_button, generate_all_styles_button, stop_button, skip_button, state_is_generating]) \
+            .then(fn=lambda: None, _js='playNotification').then(fn=lambda: None, _js='refresh_grid_delayed') \
+            .then(lambda: (gr.update(value=f"Add to queue ({len(QUEUE)})")), outputs=[add_to_queue_button])
+
+        add_to_queue_button.click(fn=queue_add, inputs=ctrls) \
+            .then(lambda: (gr.update(value=f"Add to queue ({len(QUEUE)})")), outputs=[add_to_queue_button])
 
         def trigger_describe(mode, img):
             if mode == flags.desc_type_photo:
